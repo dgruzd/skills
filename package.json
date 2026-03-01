@@ -1,7 +1,7 @@
 {
-  "name": "skills",
+  "name": "@dgruzd/skills",
   "version": "1.4.3",
-  "description": "The open agent skills ecosystem",
+  "description": "The open agent skills ecosystem (fork with GitLab update support)",
   "type": "module",
   "bin": {
     "skills": "./bin/cli.mjs",
@@ -80,14 +80,17 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vercel-labs/skills.git"
+    "url": "git+https://github.com/dgruzd/skills.git"
   },
-  "homepage": "https://github.com/vercel-labs/skills#readme",
+  "homepage": "https://github.com/dgruzd/skills#readme",
   "bugs": {
-    "url": "https://github.com/vercel-labs/skills/issues"
+    "url": "https://github.com/dgruzd/skills/issues"
   },
   "author": "",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "@clack/prompts": "^0.11.0",
     "@types/bun": "latest",

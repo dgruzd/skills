@@ -13,7 +13,12 @@ import { runList } from './list.ts';
 import { removeCommand, parseRemoveOptions } from './remove.ts';
 import { runSync, parseSyncOptions } from './sync.ts';
 import { track } from './telemetry.ts';
-import { fetchSkillFolderHash, getGitHubToken } from './skill-lock.ts';
+import {
+  fetchSkillFolderHash,
+  fetchGitLabSkillFolderHash,
+  getGitHubToken,
+  getGitLabToken,
+} from './skill-lock.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -275,6 +280,21 @@ Describe when this skill should be used.
 // Check and Update Commands
 // ============================================
 
+/**
+ * Extract the GitLab hostname from a stored source URL.
+ * Falls back to "gitlab.com" for non-HTTP URLs or parse errors.
+ * e.g. "https://gitlab.com/owner/repo.git" → "gitlab.com"
+ *      "https://git.corp.com/owner/repo.git" → "git.corp.com"
+ */
+function extractGitLabHostname(sourceUrl: string): string {
+  try {
+    const parsed = new URL(sourceUrl);
+    return parsed.hostname;
+  } catch {
+    return 'gitlab.com';
+  }
+}
+
 const AGENTS_DIR = '.agents';
 const LOCK_FILE = '.skill-lock.json';
 const CHECK_UPDATES_API_URL = 'https://add-skill.vercel.sh/check-updates';
@@ -364,10 +384,11 @@ async function runCheck(args: string[] = []): Promise<void> {
     return;
   }
 
-  // Get GitHub token from user's environment for higher rate limits
-  const token = getGitHubToken();
+  // Get tokens for authenticated requests (higher rate limits)
+  const githubToken = getGitHubToken();
+  const gitlabToken = getGitLabToken();
 
-  // Group skills by source (owner/repo) to batch GitHub API calls
+  // Group skills by source to batch API calls where possible
   const skillsBySource = new Map<string, Array<{ name: string; entry: SkillLockEntry }>>();
   let skippedCount = 0;
 
@@ -375,8 +396,12 @@ async function runCheck(args: string[] = []): Promise<void> {
     const entry = lock.skills[skillName];
     if (!entry) continue;
 
-    // Only check GitHub-sourced skills with folder hash
-    if (entry.sourceType !== 'github' || !entry.skillFolderHash || !entry.skillPath) {
+    // Only check GitHub/GitLab-sourced skills with a folder hash and path
+    if (
+      (entry.sourceType !== 'github' && entry.sourceType !== 'gitlab') ||
+      !entry.skillFolderHash ||
+      !entry.skillPath
+    ) {
       skippedCount++;
       continue;
     }
@@ -388,7 +413,7 @@ async function runCheck(args: string[] = []): Promise<void> {
 
   const totalSkills = skillNames.length - skippedCount;
   if (totalSkills === 0) {
-    console.log(`${DIM}No GitHub skills to check.${RESET}`);
+    console.log(`${DIM}No trackable skills to check.${RESET}`);
     return;
   }
 
@@ -401,14 +426,29 @@ async function runCheck(args: string[] = []): Promise<void> {
   for (const [source, skills] of skillsBySource) {
     for (const { name, entry } of skills) {
       try {
-        const latestHash = await fetchSkillFolderHash(source, entry.skillPath!, token);
+        let latestHash: string | null = null;
 
-        if (!latestHash) {
-          errors.push({ name, source, error: 'Could not fetch from GitHub' });
-          continue;
+        if (entry.sourceType === 'github') {
+          latestHash = await fetchSkillFolderHash(source, entry.skillPath!, githubToken);
+          if (!latestHash) {
+            errors.push({ name, source, error: 'Could not fetch from GitHub' });
+            continue;
+          }
+        } else if (entry.sourceType === 'gitlab') {
+          const hostname = extractGitLabHostname(entry.sourceUrl);
+          latestHash = await fetchGitLabSkillFolderHash(
+            source,
+            entry.skillPath!,
+            gitlabToken,
+            hostname
+          );
+          if (!latestHash) {
+            errors.push({ name, source, error: 'Could not fetch from GitLab' });
+            continue;
+          }
         }
 
-        if (latestHash !== entry.skillFolderHash) {
+        if (latestHash && latestHash !== entry.skillFolderHash) {
           updates.push({ name, source });
         }
       } catch (err) {
@@ -466,10 +506,11 @@ async function runUpdate(): Promise<void> {
     return;
   }
 
-  // Get GitHub token from user's environment for higher rate limits
-  const token = getGitHubToken();
+  // Get tokens for authenticated requests (higher rate limits)
+  const githubToken = getGitHubToken();
+  const gitlabToken = getGitLabToken();
 
-  // Find skills that need updates by checking GitHub directly
+  // Find skills that need updates by checking GitHub/GitLab directly
   const updates: Array<{ name: string; source: string; entry: SkillLockEntry }> = [];
   let checkedCount = 0;
 
@@ -477,15 +518,31 @@ async function runUpdate(): Promise<void> {
     const entry = lock.skills[skillName];
     if (!entry) continue;
 
-    // Only check GitHub-sourced skills with folder hash
-    if (entry.sourceType !== 'github' || !entry.skillFolderHash || !entry.skillPath) {
+    // Only check GitHub/GitLab-sourced skills with a folder hash and path
+    if (
+      (entry.sourceType !== 'github' && entry.sourceType !== 'gitlab') ||
+      !entry.skillFolderHash ||
+      !entry.skillPath
+    ) {
       continue;
     }
 
     checkedCount++;
 
     try {
-      const latestHash = await fetchSkillFolderHash(entry.source, entry.skillPath, token);
+      let latestHash: string | null = null;
+
+      if (entry.sourceType === 'github') {
+        latestHash = await fetchSkillFolderHash(entry.source, entry.skillPath, githubToken);
+      } else if (entry.sourceType === 'gitlab') {
+        const hostname = extractGitLabHostname(entry.sourceUrl);
+        latestHash = await fetchGitLabSkillFolderHash(
+          entry.source,
+          entry.skillPath,
+          gitlabToken,
+          hostname
+        );
+      }
 
       if (latestHash && latestHash !== entry.skillFolderHash) {
         updates.push({ name: skillName, source: entry.source, entry });
@@ -496,7 +553,7 @@ async function runUpdate(): Promise<void> {
   }
 
   if (checkedCount === 0) {
-    console.log(`${DIM}No skills to check.${RESET}`);
+    console.log(`${DIM}No trackable skills to check.${RESET}`);
     return;
   }
 
@@ -516,8 +573,10 @@ async function runUpdate(): Promise<void> {
   for (const update of updates) {
     console.log(`${TEXT}Updating ${update.name}...${RESET}`);
 
-    // Build the URL with subpath to target the specific skill directory
-    // e.g., https://github.com/owner/repo/tree/main/skills/my-skill
+    // Build the web URL that points at the skill subfolder so that `skills add` can
+    // re-clone the right subtree.  The format differs between GitHub and GitLab:
+    //   GitHub: https://github.com/owner/repo/tree/main/skills/my-skill
+    //   GitLab: https://gitlab.com/owner/repo/-/tree/main/skills/my-skill
     let installUrl = update.entry.sourceUrl;
     if (update.entry.skillPath) {
       // Extract the skill folder path (remove /SKILL.md suffix)
@@ -531,10 +590,17 @@ async function runUpdate(): Promise<void> {
         skillFolder = skillFolder.slice(0, -1);
       }
 
-      // Convert git URL to tree URL with path
-      // https://github.com/owner/repo.git -> https://github.com/owner/repo/tree/main/path
-      installUrl = update.entry.sourceUrl.replace(/\.git$/, '').replace(/\/$/, '');
-      installUrl = `${installUrl}/tree/main/${skillFolder}`;
+      const baseUrl = update.entry.sourceUrl.replace(/\.git$/, '').replace(/\/$/, '');
+
+      if (update.entry.sourceType === 'gitlab') {
+        // GitLab uses the /-/tree/ path pattern
+        installUrl = skillFolder
+          ? `${baseUrl}/-/tree/main/${skillFolder}`
+          : `${baseUrl}/-/tree/main`;
+      } else {
+        // GitHub (and generic git fallback) use /tree/ directly
+        installUrl = skillFolder ? `${baseUrl}/tree/main/${skillFolder}` : baseUrl;
+      }
     }
 
     // Use skills CLI to reinstall with -g -y flags
