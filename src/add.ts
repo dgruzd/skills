@@ -50,6 +50,8 @@ import { wellKnownProvider, type WellKnownSkill } from './providers/index.ts';
 import {
   addSkillToLock,
   fetchSkillFolderHash,
+  fetchGitLabSkillFolderHash,
+  getGitLabToken,
   isPromptDismissed,
   dismissPrompt,
   getLastSelectedAgents,
@@ -1481,12 +1483,31 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
         const skillDisplayName = getSkillDisplayName(skill);
         if (successfulSkillNames.has(skillDisplayName)) {
           try {
-            // Fetch the folder hash from GitHub Trees API
+            // Fetch the folder hash from the appropriate host API so that
+            // `skills check` / `skills update` can detect future changes.
             let skillFolderHash = '';
             const skillPathValue = skillFiles[skill.name];
-            if (parsed.type === 'github' && skillPathValue) {
-              const hash = await fetchSkillFolderHash(normalizedSource, skillPathValue);
-              if (hash) skillFolderHash = hash;
+            if (skillPathValue) {
+              if (parsed.type === 'github') {
+                const hash = await fetchSkillFolderHash(normalizedSource, skillPathValue);
+                if (hash) skillFolderHash = hash;
+              } else if (parsed.type === 'gitlab') {
+                // Extract the hostname from the stored URL so self-hosted instances work.
+                let hostname = 'gitlab.com';
+                try {
+                  hostname = new URL(parsed.url).hostname;
+                } catch {
+                  // keep default
+                }
+                const token = getGitLabToken();
+                const hash = await fetchGitLabSkillFolderHash(
+                  normalizedSource,
+                  skillPathValue,
+                  token,
+                  hostname
+                );
+                if (hash) skillFolderHash = hash;
+              }
             }
 
             await addSkillToLock(skill.name, {

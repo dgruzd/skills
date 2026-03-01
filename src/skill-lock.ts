@@ -151,6 +151,60 @@ export function getGitHubToken(): string | null {
 }
 
 /**
+ * Get GitLab token from user's environment.
+ * Tries in order:
+ * 1. GITLAB_TOKEN environment variable
+ * 2. GL_TOKEN environment variable
+ * 3. glab CLI auth token (if glab is installed)
+ *
+ * @returns The token string or null if not available
+ */
+export function getGitLabToken(): string | null {
+  if (process.env.GITLAB_TOKEN) {
+    return process.env.GITLAB_TOKEN;
+  }
+  if (process.env.GL_TOKEN) {
+    return process.env.GL_TOKEN;
+  }
+
+  // Try glab CLI
+  try {
+    const token = execSync('glab auth token', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (token) {
+      return token;
+    }
+  } catch {
+    // glab not installed or not authenticated
+  }
+
+  return null;
+}
+
+/**
+ * Normalize a skillPath to a folder path by stripping the trailing SKILL.md filename
+ * and any trailing slash.
+ */
+function toFolderPath(skillPath: string): string {
+  // Normalize to forward slashes
+  let folderPath = skillPath.replace(/\\/g, '/');
+
+  if (folderPath.endsWith('/SKILL.md')) {
+    folderPath = folderPath.slice(0, -9);
+  } else if (folderPath.endsWith('SKILL.md')) {
+    folderPath = folderPath.slice(0, -8);
+  }
+
+  if (folderPath.endsWith('/')) {
+    folderPath = folderPath.slice(0, -1);
+  }
+
+  return folderPath;
+}
+
+/**
  * Fetch the tree SHA (folder hash) for a skill folder using GitHub's Trees API.
  * This makes ONE API call to get the entire repo tree, then extracts the SHA
  * for the specific skill folder.
@@ -165,20 +219,7 @@ export async function fetchSkillFolderHash(
   skillPath: string,
   token?: string | null
 ): Promise<string | null> {
-  // Normalize to forward slashes first (for GitHub API compatibility)
-  let folderPath = skillPath.replace(/\\/g, '/');
-
-  // Remove SKILL.md suffix to get folder path
-  if (folderPath.endsWith('/SKILL.md')) {
-    folderPath = folderPath.slice(0, -9);
-  } else if (folderPath.endsWith('SKILL.md')) {
-    folderPath = folderPath.slice(0, -8);
-  }
-
-  // Remove trailing slash
-  if (folderPath.endsWith('/')) {
-    folderPath = folderPath.slice(0, -1);
-  }
+  const folderPath = toFolderPath(skillPath);
 
   const branches = ['main', 'master'];
 
@@ -214,6 +255,112 @@ export async function fetchSkillFolderHash(
 
       if (folderEntry) {
         return folderEntry.sha;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Fetch the tree ID (folder hash) for a skill folder using the GitLab Repository Trees API.
+ *
+ * GitLab identifies a folder by the `id` (SHA) of the tree object returned when you list
+ * the tree at that path.  One API call is made per skill folder (there is no recursive
+ * flat-tree endpoint that returns SHA the way GitHub does).
+ *
+ * Supports both gitlab.com and self-hosted instances via the `hostname` parameter.
+ *
+ * @param projectPath - URL-encoded project path, e.g. "dgruzd/scripts" or "group/subgroup/repo"
+ * @param skillPath - Path to skill folder or SKILL.md inside the repo
+ * @param token - Optional personal access token / OAuth token for authenticated requests
+ * @param hostname - GitLab hostname (default: "gitlab.com")
+ * @returns The tree SHA for the skill folder, or null if not found
+ */
+export async function fetchGitLabSkillFolderHash(
+  projectPath: string,
+  skillPath: string,
+  token?: string | null,
+  hostname = 'gitlab.com'
+): Promise<string | null> {
+  const folderPath = toFolderPath(skillPath);
+  const encodedProject = encodeURIComponent(projectPath);
+
+  const branches = ['main', 'master'];
+
+  for (const branch of branches) {
+    try {
+      // GitLab Trees API: GET /projects/:id/repository/tree
+      // With path= and ref= we get the listing of a single directory level.
+      // The "id" field on each entry is the git object SHA.
+      const params = new URLSearchParams({ ref: branch, per_page: '100' });
+      if (folderPath) {
+        params.set('path', folderPath);
+      }
+
+      const apiUrl = `https://${hostname}/api/v4/projects/${encodedProject}/repository/tree?${params}`;
+      const headers: Record<string, string> = {
+        'User-Agent': 'skills-cli',
+      };
+      if (token) {
+        headers['PRIVATE-TOKEN'] = token;
+      }
+
+      const response = await fetch(apiUrl, { headers });
+
+      if (!response.ok) continue;
+
+      const entries = (await response.json()) as Array<{
+        id: string;
+        name: string;
+        type: string;
+        path: string;
+      }>;
+
+      if (!Array.isArray(entries)) continue;
+
+      if (!folderPath) {
+        // Root-level skill: derive a stable hash by sorting entry IDs and hashing them
+        // (the root tree SHA isn't directly exposed by this endpoint).
+        const rootHash = entries
+          .map((e) => e.id)
+          .sort()
+          .join(':');
+        return createHash('sha256').update(rootHash).digest('hex');
+      }
+
+      // The folder itself appears as a "tree" entry in its *parent* directory listing.
+      // Re-request the parent path to find this folder's SHA.
+      const parentPath = folderPath.includes('/')
+        ? folderPath.slice(0, folderPath.lastIndexOf('/'))
+        : '';
+      const folderName = folderPath.includes('/')
+        ? folderPath.slice(folderPath.lastIndexOf('/') + 1)
+        : folderPath;
+
+      const parentParams = new URLSearchParams({ ref: branch, per_page: '100' });
+      if (parentPath) {
+        parentParams.set('path', parentPath);
+      }
+
+      const parentUrl = `https://${hostname}/api/v4/projects/${encodedProject}/repository/tree?${parentParams}`;
+      const parentResponse = await fetch(parentUrl, { headers });
+
+      if (!parentResponse.ok) continue;
+
+      const parentEntries = (await parentResponse.json()) as Array<{
+        id: string;
+        name: string;
+        type: string;
+      }>;
+
+      if (!Array.isArray(parentEntries)) continue;
+
+      const folderEntry = parentEntries.find((e) => e.type === 'tree' && e.name === folderName);
+      if (folderEntry) {
+        return folderEntry.id;
       }
     } catch {
       continue;
